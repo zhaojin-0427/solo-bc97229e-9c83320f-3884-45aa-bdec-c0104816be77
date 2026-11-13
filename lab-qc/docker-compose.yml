@@ -1,0 +1,15 @@
+services:
+  lab-qc-api:
+    build: .
+    image: lab-qc-api:1.0.0
+    container_name: lab-qc-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - qc-data:/data
+    environment:
+      LAB_QC_DB: /data/lab_qc.db
+    restart: unless-stopped
+
+volumes:
+  qc-data:
