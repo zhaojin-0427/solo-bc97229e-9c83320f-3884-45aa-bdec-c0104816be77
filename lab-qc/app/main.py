@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import logging
+import sqlite3
 import threading
 from contextlib import asynccontextmanager
 
@@ -12,32 +14,47 @@ from fastapi import FastAPI, File, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 
 from . import services
-from .database import DB_PATH, connect, recover_unfinished
+from .database import DB_PATH, connect, is_locked, recover_unfinished
 from .models import BatchOut, HealthOut, RecordOut, ReplacementOut, RuleIn, RuleOut
 from .services import ApiError, get_active_rule, get_rule
 
+logger = logging.getLogger("lab_qc")
 _recovered: list[int] = []
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动恢复：上次未完成的替换一律标失败，已入库记录与生效规则原样保留
+    # 启动恢复：上次未完成的替换一律标失败，已入库记录与生效规则原样保留。
+    # 启动瞬间若有外部连接持写锁，有限重试后让服务先起来，剩余在途单交给
+    # 看门狗在锁释放后自动收尾，避免启动被无限阻塞。
     global _recovered
     conn = connect()
     try:
-        _recovered = recover_unfinished(conn)
+        try:
+            _recovered = recover_unfinished(conn, max_attempts=10)
+        except sqlite3.OperationalError as exc:
+            if not is_locked(exc):
+                raise
+            logger.warning("启动恢复被外部写锁阻塞，交由看门狗在锁释放后补收尾")
+            _recovered = []
     finally:
         conn.close()
-    yield
+    # 看门狗：为异常死亡/启动时未恢复的替换补收尾（标失败 + 同事务释放互斥）
+    services.start_watchdog()
+    try:
+        yield
+    finally:
+        services.stop_watchdog()
 
 
 app = FastAPI(
     title="环境实验室入仓质控校验 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "上传仪器 CSV（样品号、项目、整数读数），按当前生效规则（含端点整数闭区间）"
         "整批接收或拒绝；规则替换在后台核查历史数据，期间继续按旧规则接收与查询，"
         "切换时全部已提交记录合格才启用新规则，否则保留旧规则并返回违规样品。"
+        "写收尾对 SQLite 写锁冲突自动重试，外部锁释放后自动完成，无需重启。"
     ),
     lifespan=lifespan,
 )
@@ -49,6 +66,19 @@ async def api_error_handler(request: Request, exc: ApiError):
         status_code=exc.status_code,
         content={"error": exc.message, "details": exc.details},
     )
+
+
+@app.exception_handler(sqlite3.OperationalError)
+async def sqlite_locked_handler(request: Request, exc: sqlite3.OperationalError):
+    # 有限重试后仍被外部写锁阻塞：明确返回 503，客户端可在锁释放后原样重试；
+    # 其余 SQLite 错误仍走默认 500
+    if is_locked(exc):
+        return JSONResponse(
+            status_code=503,
+            content={"error": "数据库当前被其他连接的写事务占用，请稍后重试",
+                     "details": [str(exc)]},
+        )
+    raise exc
 
 
 @app.get("/health", response_model=HealthOut, tags=["系统"])

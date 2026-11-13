@@ -9,15 +9,19 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
 DB_PATH = Path(os.environ.get("LAB_QC_DB", "/data/lab_qc.db"))
 
-SCHEMA = """
+# 撞写锁时单条语句的等待上限（毫秒）；可通过环境变量调小以便测试
+BUSY_TIMEOUT_MS = int(os.environ.get("LAB_QC_BUSY_TIMEOUT", "5000"))
+
+SCHEMA = f"""
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
-PRAGMA busy_timeout=5000;
+PRAGMA busy_timeout={BUSY_TIMEOUT_MS};
 
 CREATE TABLE IF NOT EXISTS rules (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -84,13 +88,43 @@ CREATE INDEX IF NOT EXISTS idx_replacements_status ON replacements(status);
 def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
     path = Path(db_path) if db_path is not None else DB_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=10, isolation_level=None)
+    conn = sqlite3.connect(str(path), timeout=max(BUSY_TIMEOUT_MS / 1000.0, 0.1),
+                           isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA synchronous=NORMAL")
     return conn
+
+
+def is_locked(exc: BaseException) -> bool:
+    """是否为 SQLite 写锁冲突（含 busy/locked，Python 驱动统一报 OperationalError）。"""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database table is locked" in msg
+
+
+def run_with_write_retry(conn: sqlite3.Connection, work,
+                         max_attempts: int | None = None,
+                         sleep_s: float = 0.1):
+    """重复执行自带写事务的 ``work(conn)``；撞写锁则等其回滚后整体重试。
+
+    收尾（标记失败/切换/释放互斥）必须在外部写锁释放后自动完成，不能因为一次
+    busy_timeout 耗尽就放弃。``work`` 内部须自行使用 ``transaction(conn)``：
+    撞锁时事务回滚，本函数等待后重跑整个事务。``max_attempts=None`` 表示无限
+    重试（收尾/看门狗路径），接口路径传有限次数后由上层返回 503。
+    """
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            return work(conn)
+        except sqlite3.OperationalError as exc:
+            if not is_locked(exc) or (max_attempts is not None and attempts >= max_attempts):
+                raise
+            time.sleep(sleep_s)
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -109,20 +143,30 @@ def transaction(conn: sqlite3.Connection):
         raise
 
 
-def recover_unfinished(conn: sqlite3.Connection) -> list[int]:
-    """启动恢复：未完成的替换一律标记失败，生效规则保持不变。"""
+def recover_unfinished(conn: sqlite3.Connection,
+                       max_attempts: int | None = None) -> list[int]:
+    """启动恢复：未完成的替换一律标记失败，生效规则保持不变。
+
+    与运行期收尾同样具备写锁重试：即便启动瞬间另有连接持写锁，也会在锁释放后
+    完成恢复，而不是让替换继续悬挂。``max_attempts=None`` 时无限重试；调用方
+    也可传有限次数，未完成的部分交由运行期看门狗继续收尾。
+    """
     init_db(conn)
-    with transaction(conn):
-        rows = conn.execute(
-            "SELECT id FROM replacements WHERE status IN ('checking','pending_switch')"
-        ).fetchall()
-        ids = [r["id"] for r in rows]
-        if ids:
-            conn.execute(
-                "UPDATE replacements SET status='failed', "
-                "failure_reason='进程重启，替换中断，按失败处理', "
-                "finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
-                "WHERE status IN ('checking','pending_switch')"
-            )
-            conn.execute("DELETE FROM replacement_locks WHERE id=1")
-    return ids
+
+    def _do(conn):
+        with transaction(conn):
+            rows = conn.execute(
+                "SELECT id FROM replacements WHERE status IN ('checking','pending_switch')"
+            ).fetchall()
+            ids = [r["id"] for r in rows]
+            if ids:
+                conn.execute(
+                    "UPDATE replacements SET status='failed', "
+                    "failure_reason='进程重启，替换中断，按失败处理', "
+                    "finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                    "WHERE status IN ('checking','pending_switch')"
+                )
+                conn.execute("DELETE FROM replacement_locks WHERE id=1")
+            return ids
+
+    return run_with_write_retry(conn, _do, max_attempts=max_attempts)
